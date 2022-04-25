@@ -1,15 +1,19 @@
 import argparse
 import colour
-import inspect
+from contextlib import contextmanager
 import importlib
+import inspect
 import os
+from screeninfo import get_monitors
 import sys
 import yaml
-from screeninfo import get_monitors
 
+from manimlib.logger import log
 from manimlib.utils.config_ops import merge_dicts_recursively
 from manimlib.utils.init_config import init_customization
-from manimlib.logger import log
+
+
+__config_file__ = "custom_config.yml"
 
 
 def parse_cli():
@@ -19,7 +23,7 @@ def parse_cli():
         module_location.add_argument(
             "file",
             nargs="?",
-            help="path to file holding the python code for the scene",
+            help="Path to file holding the python code for the scene",
         )
         parser.add_argument(
             "scene_names",
@@ -60,6 +64,12 @@ def parse_cli():
             "-f", "--full_screen",
             action="store_true",
             help="Show window in full screen",
+        )
+        parser.add_argument(
+            "-p", "--presenter_mode",
+            action="store_true",
+            help="Scene will stay paused during wait calls until "
+                 "space bar or right arrow is hit, like a slide show"
         )
         parser.add_argument(
             "-g", "--save_pngs",
@@ -107,10 +117,19 @@ def parse_cli():
         )
         parser.add_argument(
             "-n", "--start_at_animation_number",
-            help="Start rendering not from the first animation, but"
-                 "from another, specified by its index.  If you pass"
-                 "in two comma separated values, e.g. \"3,6\", it will end"
+            help="Start rendering not from the first animation, but "
+                 "from another, specified by its index.  If you pass "
+                 "in two comma separated values, e.g. \"3,6\", it will end "
                  "the rendering at the second value",
+        )
+        parser.add_argument(
+            "-e", "--embed",
+            nargs="?",
+            const="",
+            help="Creates a new file where the line `self.embed` is inserted "
+                 "into the Scenes construct method. "
+                 "If a string is passed in, the line will be inserted below the "
+                 "last line of code including that string."
         )
         parser.add_argument(
             "-r", "--resolution",
@@ -162,14 +181,78 @@ def get_manim_dir():
 def get_module(file_name):
     if file_name is None:
         return None
-    else:
-        module_name = file_name.replace(os.sep, ".").replace(".py", "")
-        spec = importlib.util.spec_from_file_location(module_name, file_name)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+    module_name = file_name.replace(os.sep, ".").replace(".py", "")
+    spec = importlib.util.spec_from_file_location(module_name, file_name)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-__config_file__ = "custom_config.yml"
+
+def get_indent(line: str):
+    return len(line) - len(line.lstrip())
+
+
+@contextmanager
+def insert_embed_line(file_name: str, scene_name: str, line_marker: str):
+    """
+    This is hacky, but convenient. When user includes the argument "-e", it will try
+    to recreate a file that inserts the line `self.embed()` into the end of the scene's
+    construct method. If there is an argument passed in, it will insert the line after
+    the last line in the sourcefile which includes that string.
+    """
+    with open(file_name, 'r') as fp:
+        lines = fp.readlines()
+
+    try:
+        scene_line_number = next(
+            i for i, line in enumerate(lines)
+            if line.startswith(f"class {scene_name}")
+        )
+    except StopIteration:
+        log.error(f"No scene {scene_name}")
+
+    prev_line_num = None
+    n_spaces = None
+    if len(line_marker) == 0:
+        # Find the end of the construct method
+        in_construct = False
+        for index in range(scene_line_number, len(lines) - 1):
+            line = lines[index]
+            if line.lstrip().startswith("def construct"):
+                in_construct = True
+                n_spaces = get_indent(line) + 4
+            elif in_construct:
+                if len(line.strip()) > 0 and get_indent(line) < n_spaces:
+                    prev_line_num = index - 2
+                    break
+    elif line_marker.isdigit():
+        # Treat the argument as a line number
+        prev_line_num = int(line_marker) - 1
+    elif len(line_marker) > 0:
+        # Treat the argument as a string
+        try:
+            prev_line_num = next(
+                i
+                for i in range(len(lines) - 1, scene_line_number, -1)
+                if line_marker in lines[i]
+            )
+        except StopIteration:
+            log.error(f"No lines matching {line_marker}")
+            sys.exit(2)
+
+    # Insert and write new file
+    if n_spaces is None:
+        n_spaces = get_indent(lines[prev_line_num])
+    new_lines = list(lines)
+    new_lines.insert(prev_line_num + 1, " " * n_spaces + "self.embed()\n")
+    alt_file = file_name.replace(".py", "_insert_embed.py")
+    with open(alt_file, 'w') as fp:
+        fp.writelines(new_lines)
+    try:
+        yield alt_file
+    finally:
+        os.remove(alt_file)
+
 
 def get_custom_config():
     global __config_file__
@@ -197,9 +280,11 @@ def get_custom_config():
 
 def check_temporary_storage(config):
     if config["directories"]["temporary_storage"] == "" and sys.platform == "win32":
-        log.warning("You may be using Windows platform and have not specified the path of"
+        log.warning(
+            "You may be using Windows platform and have not specified the path of"
             " `temporary_storage`, which may cause OSError. So it is recommended"
-            " to specify the `temporary_storage` in the config file (.yml)")
+            " to specify the `temporary_storage` in the config file (.yml)"
+        )
 
 
 def get_configuration(args):
@@ -229,8 +314,10 @@ def get_configuration(args):
 
     elif not os.path.exists(__config_file__):
         log.info(f"Using the default configuration file, which you can modify in `{global_defaults_file}`")
-        log.info("If you want to create a local configuration file, you can create a file named"
-            f" `{__config_file__}`, or run `manimgl --config`")
+        log.info(
+            "If you want to create a local configuration file, you can create a file named"
+            f" `{__config_file__}`, or run `manimgl --config`"
+        )
 
     custom_config = get_custom_config()
     check_temporary_storage(custom_config)
@@ -261,15 +348,22 @@ def get_configuration(args):
     }
 
     module = get_module(args.file)
+
+    if args.embed is not None:
+        with insert_embed_line(args.file, args.scene_names[0], args.embed) as alt_file:
+            module = get_module(alt_file)
+
     config = {
         "module": module,
         "scene_names": args.scene_names,
         "file_writer_config": file_writer_config,
         "quiet": args.quiet or args.write_all,
         "write_all": args.write_all,
+        "skip_animations": args.skip_animations,
         "start_at_animation_number": args.start_at_animation_number,
-        "preview": not write_file,
         "end_at_animation_number": None,
+        "preview": not write_file,
+        "presenter_mode": args.presenter_mode,
         "leave_progress_bars": args.leave_progress_bars,
     }
 
@@ -282,7 +376,7 @@ def get_configuration(args):
     mon_index = custom_config["window_monitor"]
     monitor = monitors[min(mon_index, len(monitors) - 1)]
     window_width = monitor.width
-    if not args.full_screen:
+    if not (args.full_screen or custom_config["full_screen"]):
         window_width //= 2
     window_height = window_width * 9 // 16
     config["window_config"] = {
@@ -299,10 +393,6 @@ def get_configuration(args):
         else:
             config["start_at_animation_number"] = int(stan)
 
-    config["skip_animations"] = any([
-        args.skip_animations,
-        args.start_at_animation_number,
-    ])
     return config
 
 
